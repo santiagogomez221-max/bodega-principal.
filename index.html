@@ -251,7 +251,14 @@ footer { color: var(--muted); font-size: .76rem; max-width: 1240px; margin: 0 au
 <button id="clave-btn" class="btn pri" type="submit">Entrar</button>
 <p id="clave-err" role="alert" style="margin:0;min-height:1.2em;color:var(--crit,#b0261d);font-size:.85rem"></p>
 </form></div>
-<style>.tab[data-tab="asistente"]{display:none}</style>
+<script>/* En la copia web el Asistente no puede responder: la pestaña abre el tablero dentro de Claude, donde sí funciona. */
+document.addEventListener('click', function (ev) {
+  var t = ev.target && ev.target.closest && ev.target.closest('.tab[data-tab="asistente"]');
+  if (!t) return;
+  ev.preventDefault(); ev.stopImmediatePropagation();
+  window.open('https://claude.ai/artifact/KETbtmCmfj7uTbuwSN49VZ', '_blank', 'noopener');
+}, true);
+</script>
 <script>/* Copia web de consulta: los datos van cifrados (AES-GCM, clave derivada con PBKDF2) y solo se abren con la clave. */
 (function () {
   const PAQP = fetch('datos.json?v=' + Date.now(), { cache: 'no-store' }).then(r => { if (!r.ok) throw new Error('sin datos'); return r.json(); });
