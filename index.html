@@ -940,6 +940,375 @@ function barrasH(filas, total) {
   return '<div class="hbars">' + filas.map(f => `<div class="hbar"><span>${esc(f.nombre)}</span><span class="num">${pesos(f.valor)}${total ? ` · ${_fN0.format(f.valor / total * 100)} %` : ''}</span><div class="pista"><i style="width:${(f.valor / max * 100).toFixed(1)}%"></i></div></div>`).join('') + '</div>';
 }
 
+/* ============================================================
+   INFORME FINANCIERO DE INVENTARIO POR GÉNERO (Excel)
+   Libro: Tablero ejecutivo + Resumen por género + una hoja por género.
+   Se arma con los datos del momento (MODELO) cada vez que se pide.
+   ============================================================ */
+const IG_VENTANA = 60;
+function _igX(s) { return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function _igCol(i) { let s = ''; i++; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; }
+function _igPesos(x) { return (+x || 0).toLocaleString('es-CO', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+function _igM(x) { return ((+x || 0) / 1e6).toLocaleString('es-CO', { minimumFractionDigits: 1, maximumFractionDigits: 1 }); }
+function _igPct(x) { return ((+x || 0) * 100).toLocaleString('es-CO', { minimumFractionDigits: 0, maximumFractionDigits: 1 }); }
+function _igHoja(n) { n = String(n).replace(/[\/\\]/g, '-').replace(/[\[\]:*?]/g, ' '); return n.length <= 31 ? n : n.slice(0, 30).replace(/[ ,]+$/, '') + '.'; }
+function _igFrase(s) { s = String(s || '').toLowerCase(); return s.charAt(0).toUpperCase() + s.slice(1); }
+function _igLista(a) { return a.length <= 1 ? (a[0] || '') : a.slice(0, -1).join(', ') + ' y ' + a[a.length - 1]; }
+function _igFecha(f) { const [a, m, d] = String(f).split('-'); return `${d}/${m}/${a}`; }
+
+/* ---------- Datos ---------- */
+function datosInformeGeneros() {
+  const corte = MODELO.fechaCorte, desde = sumaDias(corte, -(IG_VENTANA - 1));
+  const val = new Map(), cant = new Map();
+  for (const s of MODELO.salidas) {
+    if (s.fecha < desde || s.fecha > corte) continue;
+    for (const l of s.lineas) { val.set(l.id, (val.get(l.id) || 0) + (+l.sub || 0)); cant.set(l.id, (cant.get(l.id) || 0) + (+l.cant || 0)); }
+  }
+  const r2 = v => Math.round(v * 100) / 100;
+  const filas = [];
+  for (const it of todosLosItems()) {
+    const v60 = r2(val.get(it.id) || 0), c60 = cant.get(it.id) || 0, q = +it.existencia || 0;
+    if (q === 0 && v60 === 0) continue;
+    const v = r2(valorItem(it)), u = +it.precio || 0, obs = [];
+    if (q < 0) obs.push('Existencia negativa: no suma al valor');
+    else if (q > 0 && u === 0) obs.push('Costo $ 0 en OSPOS');
+    if (q > 0 && c60 === 0) obs.push('Sin salidas en 60 días');
+    if (c60 > 0 && v60 === 0) obs.push('Salidas valoradas en $ 0');
+    if (q <= 0 && c60 > 0) obs.push('Sin existencia');
+    if (q > 0 && u > 0 && Math.abs(q * u - v) > 0.01) obs.push('Valor OSPOS difiere de existencia × costo en $ ' + _igPesos(v - q * u));
+    filas.push({ it, id: it.id, nombre: it.nombre, prov: it.proveedor || '', q, u, v, v60, c60, grupo: it.grupo || 'Otros', tipo: it.tipo || 'Materia prima', obs: obs.join('; ') });
+  }
+  // Géneros de mayor a menor valor
+  const gm = new Map();
+  for (const f of filas) { const g = gm.get(f.grupo) || { nombre: f.grupo, tipo: f.tipo, filas: [], valor: 0, v60: 0, n: 0 }; g.filas.push(f); g.valor += f.v; g.v60 += f.v60; if (f.q > 0) g.n++; gm.set(f.grupo, g); }
+  const generos = [...gm.values()].sort((a, b) => b.valor - a.valor || cmpNom(a.nombre, b.nombre));
+  for (const g of generos) g.filas.sort((a, b) => b.v - a.v || b.v60 - a.v60 || cmpNom(a.nombre, b.nombre));
+  const usados = new Set();
+  for (const g of generos) { let n = _igHoja(g.nombre), k = n, i = 2; while (usados.has(k) || k === 'Tablero ejecutivo' || k === 'Resumen por género') k = n.slice(0, 28) + ' ' + i++; usados.add(k); g.hoja = k; }
+  const total = filas.reduce((s, f) => s + f.v, 0), total60 = filas.reduce((s, f) => s + f.v60, 0);
+  // Top 10 de consumo: materiales (marcas equivalentes sumadas)
+  const mats = new Map();
+  for (const f of filas) { if (f.v60 <= 0) continue; const k = f.it.material || ('#' + f.id); const m = mats.get(k) || { clave: k, nombre: f.it.material || _igFrase(f.nombre), v60: 0, miembros: [] }; m.v60 += f.v60; m.miembros.push(f); mats.set(k, m); }
+  const top = [...mats.values()].sort((a, b) => b.v60 - a.v60).slice(0, 10).map(m => {
+    const p = m.miembros.slice().sort((a, b) => b.v60 - a.v60)[0], s = estadoDe(p.it);
+    let ex = Math.max(0, p.it.existencia || 0);
+    for (const e of s.equivalentes || []) ex += Math.max(0, +e.existencia || 0) * (+e.factor || 0);
+    const porDia = +s.porDia || 0, dias = porDia > 0 ? ex / porDia : 0;
+    const est = ex <= 0 ? 'Agotado' : (dias < 5 ? 'Crítico (< 5 días)' : (dias <= 10 ? 'Alerta (5 a 10 días)' : 'Normal'));
+    let pres = String(p.it.presentacion || '').toLowerCase().replace(/\bkilos?\b/, 'kg').replace(/\bgramos?\b/, 'g').replace(/\blitros?\b/, 'L').trim();
+    if (pres === '1 unidad') pres = 'unidades';
+    const conPres = pres && !/\(/.test(m.nombre) && !/\bx\s*\d/i.test(m.nombre);
+    return { nombre: m.nombre + (conPres ? ` (${pres})` : ''), corto: m.nombre, pct: total60 ? m.v60 / total60 : 0, dia: m.v60 / IG_VENTANA, und: porDia, ex, dias, est };
+  });
+  // Hallazgos calculados
+  let neg = 0, nNeg = 0, peorNeg = null, ivaF = 0, ivaR = 0, n0 = 0, nSin = 0, vSin = 0;
+  for (const f of filas) {
+    if (f.q < 0) { nNeg++; neg += f.q * f.u; if (!peorNeg || f.q * f.u < peorNeg.q * peorNeg.u) peorNeg = f; }
+    if (f.q > 0 && f.u === 0) n0++;
+    if (f.q > 0 && f.c60 === 0) { nSin++; vSin += f.v; }
+    const t = (+f.it.iva || 0) / 100;
+    if (f.v > 0 && t > 0 && t < 1) { ivaF += f.v * (1 / (1 - t * t) - 1); ivaR += f.v * (1 / (1 - t) - 1); }
+  }
+  const crit = top.filter(t => t.dias < 1), critDia = crit.reduce((s, t) => s + t.dia, 0);
+  const hall = [];
+  if (nNeg) hall.push(['Existencias negativas (' + nNeg + ' insumo' + (nNeg > 1 ? 's' : '') + ')', '−$ ' + _igPesos(Math.abs(neg)), 'Conciliar el kárdex y registrar las entradas que faltan' + (peorNeg ? ` (ej.: ${_igFrase(peorNeg.nombre)}, ${String(peorNeg.q).replace('.', ',').replace('-', '−')})` : '') + '.']);
+  if (crit.length) hall.push(['Faltantes críticos (< 1 día): ' + _igLista(crit.map(t => t.corto.toLowerCase())), `$ ${_igM(critDia)} M/día (${_igPct(total60 ? critDia * IG_VENTANA / total60 : 0)} % del consumo)`, 'Confirmar los pedidos en curso y registrar cada entrada el mismo día.']);
+  hall.push(['Fórmula de IVA de OSPOS (costo × 0,81 en lugar de costo ÷ 1,19)', `+$ ${_igM(ivaF)} M en inventario`, 'Corregir el cálculo del precio sin IVA en OSPOS.']);
+  if (n0) hall.push([`Insumos con existencia y precio $ 0 (${n0})`, 'Sin cuantificar (falta costo de compra)', 'Asignar el costo de compra en OSPOS.']);
+  if (nSin) hall.push([`Inventario sin salidas en 60 días (${nSin} insumos)`, `$ ${_igM(vSin)} M`, 'Revisar obsolescencia o deterioro y decidir uso o baja.']);
+  hall.push(['Régimen de IVA por confirmar', `Hasta +$ ${_igM(ivaR)} M (incluye los $ ${_igM(ivaF)} M de la fórmula de IVA)`, 'Confirmar con contabilidad si el IVA pagado es mayor valor del costo.']);
+  hall.sort((a, b) => cmpNom(a[0], b[0]));
+  const bajos = top.filter(t => t.dias < 5);
+  const obs1 = `El valor del inventario está subestimado al menos en $ ${_igM(ivaF)} millones por la fórmula de IVA de OSPOS` + (n0 ? `, más ${n0} insumos con existencia sin costo.` : '.');
+  const obs2 = bajos.length ? `${bajos.length} de los 10 materiales de mayor consumo duran menos de 5 días: ${_igLista(bajos.map(t => t.corto.toLowerCase() + ' (' + (t.ex <= 0 ? 'agotado' : t.dias.toFixed(1).replace('.', ',') + ' días') + ')'))}.` : 'Ninguno de los 10 materiales de mayor consumo dura menos de 5 días.';
+  let hora = '';
+  try { const ult = (typeof ACTUALIZACIONES !== 'undefined' && ACTUALIZACIONES.length) ? ACTUALIZACIONES.map(u => u.at || '').sort().pop() : ''; if (ult && ult.slice(0, 10) >= corte) hora = ', ' + new Date(ult).toLocaleTimeString('es-CO', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Bogota' }); } catch (e) { hora = ''; }
+  const corteTxt = `Corte: ${_igFecha(corte)}${hora} · Fuente: OSPOS · Consumo: ${_igFecha(desde)} a ${_igFecha(corte)} (${IG_VENTANA} días)`;
+  return { corte, desde, corteTxt, generos, filas, total, total60, top, hall, obs1, obs2, nExist: filas.filter(f => f.q > 0).length };
+}
+
+/* ---------- Estilos ---------- */
+function _igEstilos() {
+  const fonts = [], fills = ['<fill><patternFill patternType="none"/></fill>', '<fill><patternFill patternType="gray125"/></fill>'];
+  const borders = ['<border><left/><right/><top/><bottom/><diagonal/></border>'], xfs = [], mapa = new Map();
+  const NF = { pesos: 164, pct: 165, num: 166, d1: 167, dias: 168, ent: 1 };
+  const lado = c => `<left style="thin"><color rgb="FF${c}"/></left><right style="thin"><color rgb="FF${c}"/></right><top style="thin"><color rgb="FF${c}"/></top><bottom style="thin"><color rgb="FF${c}"/></bottom><diagonal/>`;
+  const idx = (arr, x) => { let i = arr.indexOf(x); if (i < 0) { arr.push(x); i = arr.length - 1; } return i; };
+  function st(o = {}) {
+    const k = JSON.stringify(o); if (mapa.has(k)) return mapa.get(k);
+    const f = idx(fonts, `<font><b/>${o.u ? '<u/>' : ''}<sz val="${o.sz || 10}"/><color rgb="FF${o.c || '000000'}"/><name val="Arial"/><family val="2"/></font>`);
+    const fl = o.bg ? idx(fills, `<fill><patternFill patternType="solid"><fgColor rgb="FF${o.bg}"/><bgColor indexed="64"/></patternFill></fill>`) : 0;
+    const bd = o.b ? idx(borders, `<border>${lado(o.b === 'k' ? '000000' : '9DB3D6')}</border>`) : 0;
+    const nf = o.n ? NF[o.n] : 0;
+    const al = (o.h || o.w) ? `<alignment${o.h ? ` horizontal="${o.h}"` : ''} vertical="center"${o.w ? ' wrapText="1"' : ''}/>` : '';
+    xfs.push(`<xf numFmtId="${nf}" fontId="${f}" fillId="${fl}" borderId="${bd}" xfId="0" applyFont="1"${nf ? ' applyNumberFormat="1"' : ''}${fl ? ' applyFill="1"' : ''}${bd ? ' applyBorder="1"' : ''}${al ? ' applyAlignment="1">' + al + '</xf>' : '/>'}`);
+    mapa.set(k, xfs.length - 1); return xfs.length - 1;
+  }
+  st({});
+  function xml() {
+    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+      + '<numFmts count="5"><numFmt numFmtId="164" formatCode="&quot;$&quot; #,##0.00"/><numFmt numFmtId="165" formatCode="0.00%"/><numFmt numFmtId="166" formatCode="#,##0.00"/><numFmt numFmtId="167" formatCode="0.0"/><numFmt numFmtId="168" formatCode="0.0 &quot;días&quot;"/></numFmts>'
+      + `<fonts count="${fonts.length}">${fonts.join('')}</fonts><fills count="${fills.length}">${fills.join('')}</fills><borders count="${borders.length}">${borders.join('')}</borders>`
+      + '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+      + `<cellXfs count="${xfs.length}">${xfs.join('')}</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>`
+      + '<dxfs count="2"><dxf><font><b/><color rgb="FFC00000"/></font></dxf><dxf><font><b/><color rgb="FFBF8F00"/></font></dxf></dxfs></styleSheet>';
+  }
+  return { st, xml };
+}
+
+/* ---------- Hoja ---------- */
+function _igHojaXml(h) {
+  // h.filas[r] = [celda por columna]; celda = {v, f, s}; r empieza en 1
+  let x = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">';
+  if (h.color) x += `<sheetPr><tabColor rgb="FF${h.color}"/><pageSetUpPr fitToPage="1"/></sheetPr>`; else x += '<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>';
+  x += `<sheetViews><sheetView workbookViewId="0" showGridLines="0"${h.activa ? ' tabSelected="1"' : ''}>`;
+  if (h.fijar) x += `<pane ySplit="${h.fijar - 1}" topLeftCell="A${h.fijar}" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A${h.fijar}" sqref="A${h.fijar}"/>`;
+  x += '</sheetView></sheetViews><sheetFormatPr defaultRowHeight="13.8"/>';
+  x += '<cols>' + h.anchos.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join('') + '</cols><sheetData>';
+  const nf = h.filas.length;
+  for (let r = 1; r < nf; r++) {
+    const fila = h.filas[r] || [], alto = h.altos && h.altos[r];
+    if (!fila.length && !alto) continue;
+    x += `<row r="${r}"${alto ? ` ht="${alto}" customHeight="1"` : ''}>`;
+    fila.forEach((c, i) => {
+      if (!c) return;
+      const ref = _igCol(i) + r, s = c.s || 0;
+      if (c.f) {
+        const f = `<f>${_igX(c.f)}</f>`;
+        if (typeof c.v === 'number' && isFinite(c.v)) x += `<c r="${ref}" s="${s}">${f}<v>${c.v}</v></c>`;
+        else x += `<c r="${ref}" s="${s}" t="str">${f}<v>${_igX(c.v ?? '')}</v></c>`;
+      } else if (typeof c.v === 'number' && isFinite(c.v)) x += `<c r="${ref}" s="${s}"><v>${c.v}</v></c>`;
+      else if (c.v === '' || c.v === null || c.v === undefined) x += `<c r="${ref}" s="${s}"/>`;
+      else x += `<c r="${ref}" s="${s}" t="inlineStr"><is><t xml:space="preserve">${_igX(c.v)}</t></is></c>`;
+    });
+    x += '</row>';
+  }
+  x += '</sheetData>';
+  if (h.filtro) x += `<autoFilter ref="${h.filtro}"/>`;
+  let pr = 1;
+  for (const rng of h.semaforo || []) x += `<conditionalFormatting sqref="${rng}"><cfRule type="cellIs" dxfId="0" priority="${pr++}" operator="lessThan"><formula>5</formula></cfRule><cfRule type="cellIs" dxfId="1" priority="${pr++}" operator="between"><formula>5</formula><formula>10</formula></cfRule></conditionalFormatting>`;
+  x += '<pageMargins left="0.4" right="0.4" top="0.5" bottom="0.5" header="0.3" footer="0.3"/>';
+  x += `<pageSetup paperSize="1" orientation="${h.vertical ? 'portrait' : 'landscape'}" fitToWidth="1" fitToHeight="${h.unaPagina ? 1 : 0}"/>`;
+  if (h.cortes && h.cortes.length) x += `<rowBreaks count="${h.cortes.length}" manualBreakCount="${h.cortes.length}">` + h.cortes.map(b => `<brk id="${b}" max="16383" man="1"/>`).join('') + '</rowBreaks>';
+  if (h.dibujo) x += '<drawing r:id="rId1"/>';
+  return x + '</worksheet>';
+}
+
+/* ---------- Gráficos ---------- */
+function _igGraficoBarras(hoja, filaIni, filaFin, cats, vals) {
+  const q = `'${hoja.replace(/'/g, "''")}'`;
+  return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><c:roundedCorners val="0"/><c:chart>'
+    + '<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1200" b="1"/></a:pPr><a:r><a:rPr lang="es-CO" sz="1200" b="1"/><a:t>Valor por género</a:t></a:r></a:p></c:rich></c:tx><c:overlay val="0"/></c:title><c:autoTitleDeleted val="0"/>'
+    + '<c:plotArea><c:layout/><c:barChart><c:barDir val="bar"/><c:grouping val="clustered"/><c:varyColors val="0"/><c:ser><c:idx val="0"/><c:order val="0"/>'
+    + `<c:tx><c:v>Valor ($)</c:v></c:tx><c:spPr><a:solidFill><a:srgbClr val="1F3864"/></a:solidFill></c:spPr><c:invertIfNegative val="0"/>`
+    + `<c:cat><c:strRef><c:f>${_igX(q)}!$B$${filaIni}:$B$${filaFin}</c:f><c:strCache><c:ptCount val="${cats.length}"/>` + cats.map((c, i) => `<c:pt idx="${i}"><c:v>${_igX(c)}</c:v></c:pt>`).join('') + '</c:strCache></c:strRef></c:cat>'
+    + `<c:val><c:numRef><c:f>${_igX(q)}!$D$${filaIni}:$D$${filaFin}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="${vals.length}"/>` + vals.map((v, i) => `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`).join('') + '</c:numCache></c:numRef></c:val>'
+    + '</c:ser><c:gapWidth val="40"/><c:axId val="501"/><c:axId val="502"/></c:barChart>'
+    + '<c:catAx><c:axId val="501"/><c:scaling><c:orientation val="maxMin"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:numFmt formatCode="General" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/><c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="800"/></a:pPr><a:endParaRPr lang="es-CO"/></a:p></c:txPr><c:crossAx val="502"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/><c:noMultiLvlLbl val="0"/></c:catAx>'
+    + '<c:valAx><c:axId val="502"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="t"/><c:numFmt formatCode="&quot;$&quot; #,##0,,&quot;M&quot;" sourceLinked="0"/><c:majorTickMark val="out"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/><c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="800"/></a:pPr><a:endParaRPr lang="es-CO"/></a:p></c:txPr><c:crossAx val="501"/><c:crosses val="autoZero"/><c:crossBetween val="between"/></c:valAx>'
+    + '</c:plotArea><c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart></c:chartSpace>';
+}
+function _igGraficoTorta(hoja, filaIni, filaFin, cats, vals) {
+  const q = `'${hoja.replace(/'/g, "''")}'`, col = ['1F3864', '8EA9DB'];
+  return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><c:roundedCorners val="0"/><c:chart>'
+    + '<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1200" b="1"/></a:pPr><a:r><a:rPr lang="es-CO" sz="1200" b="1"/><a:t>Materia prima y empaque</a:t></a:r></a:p></c:rich></c:tx><c:overlay val="0"/></c:title><c:autoTitleDeleted val="0"/>'
+    + '<c:plotArea><c:layout/><c:pieChart><c:varyColors val="1"/><c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:v>Valor ($)</c:v></c:tx>'
+    + cats.map((_, i) => `<c:dPt><c:idx val="${i}"/><c:bubble3D val="0"/><c:spPr><a:solidFill><a:srgbClr val="${col[i % 2]}"/></a:solidFill><a:ln><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill></a:ln></c:spPr></c:dPt>`).join('')
+    + '<c:dLbls><c:numFmt formatCode="0.0%" sourceLinked="0"/><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr><c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1000" b="1"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill></a:defRPr></a:pPr><a:endParaRPr lang="es-CO"/></a:p></c:txPr><c:showLegendKey val="0"/><c:showVal val="0"/><c:showCatName val="0"/><c:showSerName val="0"/><c:showPercent val="1"/><c:showBubbleSize val="0"/><c:showLeaderLines val="0"/></c:dLbls>'
+    + `<c:cat><c:strRef><c:f>${_igX(q)}!$B$${filaIni}:$B$${filaFin}</c:f><c:strCache><c:ptCount val="${cats.length}"/>` + cats.map((c, i) => `<c:pt idx="${i}"><c:v>${_igX(c)}</c:v></c:pt>`).join('') + '</c:strCache></c:strRef></c:cat>'
+    + `<c:val><c:numRef><c:f>${_igX(q)}!$D$${filaIni}:$D$${filaFin}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="${vals.length}"/>` + vals.map((v, i) => `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`).join('') + '</c:numCache></c:numRef></c:val>'
+    + '</c:ser><c:firstSliceAng val="0"/></c:pieChart></c:plotArea><c:legend><c:legendPos val="b"/><c:overlay val="0"/></c:legend><c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart></c:chartSpace>';
+}
+function _igDibujo() {
+  const anc = (id, c1, r1, c2, r2) => `<xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>${c1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${r1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>${c2}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${r2}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${id + 1}" name="Gráfico ${id}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId${id}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>`;
+  return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+    + anc(1, 9, 4, 19, 26) + anc(2, 9, 29, 16, 47) + '</xdr:wsDr>';
+}
+
+/* ---------- Libro ---------- */
+function crearInformeGenerosXlsx(D) {
+  const E = _igEstilos(), st = E.st;
+  const NAVY = '1F3864', AZUL = '2E75B6', CLARO = 'DCE6F1', ZEBRA = 'F3F6FA', TOT = 'D9E1F2', GRIS = '595959', ROJO = 'C00000';
+  const S = {
+    t1: st({}), t2: st({ sz: 13 }), t3: st({}), link: st({ u: 1, c: NAVY }),
+    enc: st({ b: 'k', h: 'center', w: 1 }), txt: st({ b: 'k' }), txtW: st({ b: 'k', w: 1 }), cod: st({ b: 'k', h: 'center' }),
+    num: st({ b: 'k', n: 'num' }), pesos: st({ b: 'k', n: 'pesos' }), pct: st({ b: 'k', n: 'pct' }), d1: st({ b: 'k', n: 'd1' }), ent: st({ b: 'k', n: 'ent', h: 'center' }),
+    nota: st({}), linkK: st({ b: 'k', u: 1, c: NAVY })
+  };
+  const hojas = [];
+  const nG = D.generos.length;
+  // ---- Hojas de detalle
+  const det = new Map();
+  for (const g of D.generos) {
+    const F = [], r0 = 7, rt = r0 + g.filas.length;
+    F[1] = [{ v: 'Panificadora Santa Catalina S.A.S. · NIT 900.883.055-8 · Bodega Principal, Pereira', s: S.t1 }];
+    F[2] = [{ v: 'Detalle del género: ' + g.nombre, s: S.t2 }];
+    F[3] = [{ v: D.corteTxt, s: S.t3 }];
+    F[4] = [{ f: `HYPERLINK("#'Resumen por género'!A1","← Volver al resumen")`, v: '← Volver al resumen', s: S.link }];
+    F[6] = ['Código', 'Insumo', 'Proveedor', 'Existencia', 'Costo unitario ($)', 'Valor ($)', '% del género', 'Salidas 60 días ($)', 'Consumo diario ($)', 'Días de cobertura', 'Observación'].map(t => ({ v: t, s: S.enc }));
+    let sv = 0, s60 = 0;
+    for (const f of g.filas) { sv += f.v; s60 += f.v60; }
+    g.filas.forEach((f, j) => {
+      const r = r0 + j, cd = f.v60 / IG_VENTANA;
+      F[r] = [{ v: f.id, s: S.cod }, { v: f.nombre, s: S.txtW }, { v: f.prov || 'Sin proveedor en OSPOS', s: S.txtW }, { v: f.q, s: S.num }, { v: f.u, s: S.pesos }, { v: f.v, s: S.pesos },
+        { f: `IF($F$${rt}=0,0,F${r}/$F$${rt})`, v: sv ? f.v / sv : 0, s: S.pct }, { v: f.v60, s: S.pesos }, { f: `H${r}/${IG_VENTANA}`, v: cd, s: S.pesos },
+        { f: `IF(I${r}=0,"",F${r}/I${r})`, v: cd ? f.v / cd : '', s: S.d1 }, { v: f.obs, s: S.txtW }];
+    });
+    const cdT = s60 / IG_VENTANA;
+    F[rt] = [{ v: '', s: S.txt }, { v: 'TOTAL', s: S.txt }, { v: '', s: S.txt }, { v: '', s: S.txt }, { v: '', s: S.txt },
+      { f: `SUM(F${r0}:F${rt - 1})`, v: sv, s: S.pesos }, { f: `SUM(G${r0}:G${rt - 1})`, v: sv ? 1 : 0, s: S.pct }, { f: `SUM(H${r0}:H${rt - 1})`, v: s60, s: S.pesos },
+      { f: `SUM(I${r0}:I${rt - 1})`, v: cdT, s: S.pesos }, { f: `IF(I${rt}=0,"",F${rt}/I${rt})`, v: cdT ? sv / cdT : '', s: S.d1 }, { v: '', s: S.txt }];
+    F[rt + 2] = [{ v: 'Valor según OSPOS (existencia × costo unitario sin IVA). Las existencias negativas no suman.', s: S.nota }];
+    F[rt + 3] = [{ v: `Consumo diario = salidas a producción de los últimos ${IG_VENTANA} días ÷ ${IG_VENTANA}. Días de cobertura = valor ÷ consumo diario.`, s: S.nota }];
+    F[rt + 4] = [{ v: 'Incluye los insumos con existencia o con salidas en el periodo; ordenados de mayor a menor valor.', s: S.nota }];
+    det.set(g.nombre, { r0, rt, sv, s60, cdT, n: g.n });
+    hojas.push({ nombre: g.hoja, xml: _igHojaXml({ filas: F, anchos: [9, 52, 36, 13, 20, 20, 12, 20, 19, 12, 56], fijar: 7, filtro: `A6:K${Math.max(rt - 1, 6)}` }) });
+  }
+  // ---- Resumen por género
+  const R = [], R0 = 6, RT = R0 + nG, RE = RT + 3, RM = RT + 4;
+  R[1] = [{ v: 'Panificadora Santa Catalina S.A.S. · NIT 900.883.055-8 · Bodega Principal, Pereira', s: S.t1 }];
+  R[2] = [{ v: 'Informe de inventario de materia prima por género de producto', s: S.t2 }];
+  R[3] = [{ v: D.corteTxt, s: S.t3 }];
+  R[5] = ['Género', 'Tipo', 'N.º de insumos con existencia', 'Valor ($)', '% del total', 'Consumo diario ($)', 'Días de cobertura'].map(t => ({ v: t, s: S.enc }));
+  const tot = { v: 0, cd: 0, n: 0 }, porTipo = { 'Empaque': { v: 0, cd: 0 }, 'Materia prima': { v: 0, cd: 0 } };
+  D.generos.forEach((g, j) => { const d = det.get(g.nombre); tot.v += d.sv; tot.cd += d.cdT; tot.n += d.n; const pt = porTipo[g.tipo] || (porTipo[g.tipo] = { v: 0, cd: 0 }); pt.v += d.sv; pt.cd += d.cdT; });
+  D.generos.forEach((g, j) => {
+    const r = R0 + j, d = det.get(g.nombre), q = `'${g.hoja.replace(/'/g, "''")}'`;
+    R[r] = [{ f: `HYPERLINK("#${q}!A1","${g.nombre.replace(/"/g, '""')}")`, v: g.nombre, s: S.linkK }, { v: g.tipo, s: S.txt },
+      { f: `COUNTIF(${q}!D${d.r0}:D${Math.max(d.rt - 1, d.r0)},">0")`, v: d.n, s: S.ent }, { f: `${q}!F${d.rt}`, v: d.sv, s: S.pesos },
+      { f: `IF($D$${RT}=0,0,D${r}/$D$${RT})`, v: tot.v ? d.sv / tot.v : 0, s: S.pct }, { f: `${q}!I${d.rt}`, v: d.cdT, s: S.pesos },
+      { f: `IF(F${r}=0,"",D${r}/F${r})`, v: d.cdT ? d.sv / d.cdT : '', s: S.d1 }];
+  });
+  R[RT] = [{ v: 'TOTAL', s: S.txt }, { v: '', s: S.txt }, { f: `SUM(C${R0}:C${RT - 1})`, v: tot.n, s: S.ent }, { f: `SUM(D${R0}:D${RT - 1})`, v: tot.v, s: S.pesos },
+    { f: `SUM(E${R0}:E${RT - 1})`, v: tot.v ? 1 : 0, s: S.pct }, { f: `SUM(F${R0}:F${RT - 1})`, v: tot.cd, s: S.pesos }, { f: `IF(F${RT}=0,"",D${RT}/F${RT})`, v: tot.cd ? tot.v / tot.cd : '', s: S.d1 }];
+  R[RT + 2] = [{ v: 'Por tipo', s: S.txt }, { v: '', s: S.txt }, { v: '', s: S.txt }, { v: 'Valor ($)', s: S.enc }, { v: '% del total', s: S.enc }, { v: 'Consumo diario ($)', s: S.enc }, { v: 'Días de cobertura', s: S.enc }];
+  [['Empaque', RE], ['Materia prima', RM]].forEach(([t, r]) => {
+    const p = porTipo[t] || { v: 0, cd: 0 };
+    R[r] = [{ v: t, s: S.txt }, { v: '', s: S.txt }, { v: '', s: S.txt }, { f: `SUMIF($B$${R0}:$B$${RT - 1},A${r},$D$${R0}:$D$${RT - 1})`, v: p.v, s: S.pesos },
+      { f: `IF($D$${RT}=0,0,D${r}/$D$${RT})`, v: tot.v ? p.v / tot.v : 0, s: S.pct }, { f: `SUMIF($B$${R0}:$B$${RT - 1},A${r},$F$${R0}:$F$${RT - 1})`, v: p.cd, s: S.pesos },
+      { f: `IF(F${r}=0,"",D${r}/F${r})`, v: p.cd ? p.v / p.cd : '', s: S.d1 }];
+  });
+  ['Ordenado de mayor a menor valor. Clic en el nombre del género para ver el detalle de sus insumos.', 'Valor sin IVA según OSPOS, sin conteo físico. Las existencias negativas no suman al valor.',
+    `Consumo diario = salidas a producción de los últimos ${IG_VENTANA} días ÷ ${IG_VENTANA} (promedio histórico, no pronóstico).`, 'Días de cobertura = valor en existencia ÷ consumo diario.'].forEach((t, i) => R[RM + 2 + i] = [{ v: t, s: S.nota }]);
+  const resumen = { nombre: 'Resumen por género', xml: _igHojaXml({ filas: R, anchos: [40, 16, 16, 22, 13, 22, 13], fijar: 6, filtro: `A5:G${RT - 1}`, altos: { 5: 30 }, vertical: false, unaPagina: true }) };
+  // ---- Tablero ejecutivo
+  const T = [], A = {};
+  const G0 = 15, GT = G0 + nG, C0 = GT + 2, TOP0 = GT + 10, H0 = TOP0 + 14, nH = D.hall.length, NOTA = H0 + nH + 1;
+  const fill = bg => ({ bg });
+  const ts = o => st(o);
+  const banda = (r, txt, sz) => { T[r] = [null]; for (let c = 1; c <= 7; c++) T[r][c] = { v: c === 1 ? txt : '', s: ts({ bg: NAVY, c: 'FFFFFF', sz }) }; };
+  banda(1, 'Panificadora Santa Catalina S.A.S. · NIT 900.883.055-8 · Bodega Principal, Pereira', 10);
+  banda(2, 'Tablero ejecutivo financiero de inventario', 18);
+  banda(3, D.corteTxt, 10);
+  const mp = porTipo['Materia prima'] || { v: 0 };
+  const topPct = D.top.reduce((s, t) => s + t.pct, 0), nCrit = D.top.filter(t => t.dias < 5).length;
+  const kpis = [['Valor del inventario', `'Resumen por género'!D${RT}`, tot.v, 'pesos', `${tot.n} insumos con existencia`],
+    ['Consumo diario promedio', `'Resumen por género'!F${RT}`, tot.cd, 'pesos', `Salidas de ${IG_VENTANA} días ÷ ${IG_VENTANA}`],
+    ['Cobertura del inventario', `'Resumen por género'!G${RT}`, tot.cd ? tot.v / tot.cd : '', 'dias', 'Valor ÷ consumo diario'],
+    ['Participación materia prima', `'Resumen por género'!E${RM}`, tot.v ? mp.v / tot.v : 0, 'pct', 'Resto: empaque'],
+    ['Concentración del consumo', `SUM(C${TOP0}:C${TOP0 + D.top.length - 1})`, topPct, 'pct', '10 materiales de mayor consumo'],
+    ['Agotados o críticos (< 5 días)', `COUNTIF(G${TOP0}:G${TOP0 + D.top.length - 1},"<5")`, nCrit, 'ent', 'De los 10 de mayor consumo']];
+  T[5] = [null]; T[6] = [null]; T[7] = [null];
+  kpis.forEach((k, j) => {
+    const c = 1 + j;
+    T[5][c] = { v: k[0], s: ts({ bg: NAVY, c: 'FFFFFF', sz: 9, b: 'a', h: 'center', w: 1 }) };
+    T[6][c] = { f: k[1], v: k[2], s: ts({ bg: CLARO, c: j === 5 ? ROJO : NAVY, sz: 16, b: 'a', h: 'center', n: k[3] }) };
+    T[7][c] = { v: k[4], s: ts({ bg: ZEBRA, c: GRIS, sz: 9, b: 'a', h: 'center', w: 1 }) };
+  });
+  const sal = ts({ bg: 'FBE5D6' });
+  [9, 10, 11].forEach(r => { T[r] = [null]; for (let c = 1; c <= 7; c++) T[r][c] = { v: '', s: sal }; });
+  T[9][1] = { v: 'Observaciones al corte (cálculo automático)', s: ts({ bg: 'FBE5D6', c: ROJO, sz: 11 }) };
+  T[10][1] = { v: D.obs1, s: sal }; T[11][1] = { v: D.obs2, s: sal };
+  const tit = (r, t) => { T[r] = [null, { v: t, s: ts({ c: NAVY, sz: 12 }) }]; };
+  const enc = (r, cols) => { T[r] = [null]; cols.forEach((t, i) => T[r][1 + i] = { v: t, s: ts({ bg: NAVY, c: 'FFFFFF', sz: 9, b: 'a', h: 'center', w: 1 }) }); };
+  const cel = (r, j, o = {}) => ts(Object.assign({ b: 'a', sz: 9 }, (j % 2 === 1) ? { bg: ZEBRA } : {}, o));
+  tit(13, 'Valor del inventario por género (de mayor a menor)');
+  enc(14, ['Género', 'Tipo', 'Valor ($)', '% del total', 'Consumo diario ($)', 'Días de cobertura', 'Participación (escala: mayor = 25 bloques)']);
+  const maxPct = Math.max(0, ...D.generos.map(g => tot.v ? det.get(g.nombre).sv / tot.v : 0));
+  D.generos.forEach((g, j) => {
+    const r = G0 + j, rr = R0 + j, d = det.get(g.nombre), pct = tot.v ? d.sv / tot.v : 0, q = `'${g.hoja.replace(/'/g, "''")}'`;
+    T[r] = [null, { f: `HYPERLINK("#${q}!A1",'Resumen por género'!A${rr})`, v: g.nombre, s: cel(r, j, { u: 1, c: NAVY }) },
+      { f: `'Resumen por género'!B${rr}`, v: g.tipo, s: cel(r, j) }, { f: `'Resumen por género'!D${rr}`, v: d.sv, s: cel(r, j, { n: 'pesos' }) },
+      { f: `'Resumen por género'!E${rr}`, v: pct, s: cel(r, j, { n: 'pct' }) }, { f: `'Resumen por género'!F${rr}`, v: d.cdT, s: cel(r, j, { n: 'pesos' }) },
+      { f: `'Resumen por género'!G${rr}`, v: d.cdT ? d.sv / d.cdT : '', s: cel(r, j, { n: 'd1' }) },
+      { f: `REPT("█",ROUND(E${r}/MAX($E$${G0}:$E$${GT - 1})*25,0))`, v: '█'.repeat(maxPct ? Math.round(pct / maxPct * 25) : 0), s: cel(r, j, { c: AZUL }) }];
+  });
+  const tt = ts({ b: 'a', sz: 9, bg: TOT, c: NAVY });
+  T[GT] = [null, { v: 'TOTAL', s: tt }, { v: '', s: tt }, { f: `'Resumen por género'!D${RT}`, v: tot.v, s: ts({ b: 'a', sz: 9, bg: TOT, c: NAVY, n: 'pesos' }) },
+    { f: `'Resumen por género'!E${RT}`, v: tot.v ? 1 : 0, s: ts({ b: 'a', sz: 9, bg: TOT, c: NAVY, n: 'pct' }) }, { f: `'Resumen por género'!F${RT}`, v: tot.cd, s: ts({ b: 'a', sz: 9, bg: TOT, c: NAVY, n: 'pesos' }) },
+    { f: `'Resumen por género'!G${RT}`, v: tot.cd ? tot.v / tot.cd : '', s: ts({ b: 'a', sz: 9, bg: TOT, c: NAVY, n: 'd1' }) }, { v: '', s: tt }];
+  tit(C0, 'Composición por tipo');
+  enc(C0 + 1, ['Tipo', '', 'Valor ($)', '% del total', 'Consumo diario ($)', 'Días de cobertura']);
+  [['Materia prima', RM], ['Empaque', RE]].forEach(([t, rr], j) => {
+    const r = C0 + 2 + j, p = porTipo[t] || { v: 0, cd: 0 };
+    T[r] = [null, { f: `'Resumen por género'!A${rr}`, v: t, s: cel(r, j) }, { v: '', s: cel(r, j) }, { f: `'Resumen por género'!D${rr}`, v: p.v, s: cel(r, j, { n: 'pesos' }) },
+      { f: `'Resumen por género'!E${rr}`, v: tot.v ? p.v / tot.v : 0, s: cel(r, j, { n: 'pct' }) }, { f: `'Resumen por género'!F${rr}`, v: p.cd, s: cel(r, j, { n: 'pesos' }) },
+      { f: `'Resumen por género'!G${rr}`, v: p.cd ? p.v / p.cd : '', s: cel(r, j, { n: 'd1' }) }];
+  });
+  tit(TOP0 - 2, 'Los 10 materiales de mayor consumo (de mayor a menor): promedio diario y días que alcanza la existencia');
+  enc(TOP0 - 1, ['Material', '% del consumo', 'Consumo diario ($)', 'Unidades por día', 'Existencia', 'Días', 'Estado']);
+  const EST = { 'Agotado': ['FFC7CE', '9C0006'], 'Crítico (< 5 días)': ['FFC7CE', '9C0006'], 'Alerta (5 a 10 días)': ['FFEB9C', '9C5700'], 'Normal': ['C6EFCE', '006100'] };
+  D.top.forEach((t, j) => {
+    const r = TOP0 + j, e = EST[t.est];
+    T[r] = [null, { v: t.nombre, s: cel(r, j) }, { v: Math.round(t.pct * 10000) / 10000, s: cel(r, j, { n: 'pct' }) }, { v: Math.round(t.dia * 100) / 100, s: cel(r, j, { n: 'pesos' }) },
+      { v: Math.round(t.und * 100) / 100, s: cel(r, j, { n: 'num' }) }, { v: Math.round(t.ex * 100) / 100, s: cel(r, j, { n: 'num' }) }, { v: Math.round(t.dias * 10) / 10, s: cel(r, j, { n: 'd1' }) },
+      { v: t.est, s: ts({ b: 'a', sz: 9, bg: e[0], c: e[1] }) }];
+  });
+  const TT = TOP0 + D.top.length;
+  T[TT] = [null, { v: 'Total 10 materiales', s: tt }, { f: `SUM(C${TOP0}:C${TT - 1})`, v: Math.round(topPct * 10000) / 10000, s: ts({ b: 'a', sz: 9, bg: TOT, c: NAVY, n: 'pct' }) },
+    { f: `SUM(D${TOP0}:D${TT - 1})`, v: Math.round(D.top.reduce((s, t) => s + Math.round(t.dia * 100) / 100, 0) * 100) / 100, s: ts({ b: 'a', sz: 9, bg: TOT, c: NAVY, n: 'pesos' }) },
+    { v: '', s: tt }, { v: '', s: tt }, { v: '', s: tt }, { v: '', s: tt }];
+  tit(H0 - 2, 'Hallazgos al corte');
+  enc(H0 - 1, ['Hallazgo', 'Impacto', 'Acción recomendada']);
+  const altos = { 2: 30, 5: 28, 6: 34, 7: 24, 14: 28 };
+  D.hall.forEach((h, j) => {
+    const r = H0 + j;
+    T[r] = [null, { v: h[0], s: cel(r, j, { w: 1 }) }, { v: h[1], s: cel(r, j, { w: 1, c: ROJO }) }, { v: h[2], s: cel(r, j, { w: 1 }) }];
+    altos[r] = 50;
+  });
+  const gr = ts({ c: GRIS, sz: 9 });
+  T[NOTA] = [null, { v: 'Supuestos: fuente OSPOS sin conteo físico; consumo = promedio histórico de ' + IG_VENTANA + ' días calendario, no pronóstico. Existencias negativas no restan.', s: gr }];
+  T[NOTA + 1] = [null, { v: 'Valores sin IVA y sin la corrección de la fórmula de IVA de OSPOS. Método de costeo por confirmar (NIIF para Pymes, Sección 13).', s: gr }];
+  T[NOTA + 2] = [null, { v: 'Las cifras por género salen de la hoja "Resumen por género". El top 10 suma las marcas equivalentes de cada material. Los hallazgos se calculan con las mismas reglas en cada corte.', s: gr }];
+  const tablero = { nombre: 'Tablero ejecutivo', xml: _igHojaXml({ filas: T, anchos: [2, 44, 24, 24, 24, 24, 24, 36], fijar: 4, altos, color: NAVY, activa: true, dibujo: true, cortes: [TOP0 - 4], semaforo: [`G${G0}:G${GT - 1}`, `G${C0 + 2}:G${C0 + 3}`, `G${TOP0}:G${TT - 1}`] }) };
+  // ---- Ensamblar
+  const todas = [tablero, resumen, ...hojas];
+  const graf1 = _igGraficoBarras('Tablero ejecutivo', G0, GT - 1, D.generos.map(g => g.nombre), D.generos.map(g => Math.round(det.get(g.nombre).sv * 100) / 100));
+  const graf2 = _igGraficoTorta('Tablero ejecutivo', C0 + 2, C0 + 3, ['Materia prima', 'Empaque'], [Math.round((porTipo['Materia prima'] || { v: 0 }).v * 100) / 100, Math.round((porTipo['Empaque'] || { v: 0 }).v * 100) / 100]);
+  const ns = n => _igX(n);
+  const archivos = [
+    { nombre: '[Content_Types].xml', datos: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/><Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/><Override PartName="/xl/charts/chart2.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>'
+      + todas.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('') + '</Types>' },
+    { nombre: '_rels/.rels', datos: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>' },
+    { nombre: 'xl/workbook.xml', datos: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><bookViews><workbookView activeTab="0"/></bookViews><sheets>'
+      + todas.map((h, i) => `<sheet name="${ns(h.nombre)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('') + '</sheets>'
+      + `<definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">'Tablero ejecutivo'!$A$1:$H$${NOTA + 2}</definedName></definedNames><calcPr calcId="191029" fullCalcOnLoad="1"/></workbook>` },
+    { nombre: 'xl/_rels/workbook.xml.rels', datos: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + todas.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join('') + `<Relationship Id="rId${todas.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>` },
+    { nombre: 'xl/styles.xml', datos: E.xml() },
+    { nombre: 'xl/worksheets/_rels/sheet1.xml.rels', datos: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>' },
+    { nombre: 'xl/drawings/drawing1.xml', datos: _igDibujo() },
+    { nombre: 'xl/drawings/_rels/drawing1.xml.rels', datos: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart2.xml"/></Relationships>' },
+    { nombre: 'xl/charts/chart1.xml', datos: graf1 },
+    { nombre: 'xl/charts/chart2.xml', datos: graf2 }
+  ];
+  todas.forEach((h, i) => archivos.push({ nombre: `xl/worksheets/sheet${i + 1}.xml`, datos: h.xml }));
+  return _zip(archivos);
+}
+
+async function xlsInformeGeneros() {
+  if (!DL) { toast('La descarga de Excel no está disponible en esta vista. Abre la página en claude.ai o en la app de Claude.'); return; }
+  const nombre = 'Inventario_Materia_Prima_por_Genero_' + MODELO.fechaCorte + '.xlsx';
+  try {
+    const bytes = crearInformeGenerosXlsx(datosInformeGeneros());
+    await DL.save({ filename: nombre, data: new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) });
+    toast('Excel generado: ' + nombre);
+  } catch (e) {
+    if (e && e.code === 'declined') return;
+    if (e && e.code === 'rate_limited') { toast('Ya hay una descarga esperando confirmación.'); return; }
+    toast('No se pudo generar el Excel (' + ((e && e.code) || (e && e.message) || 'error') + ').');
+  }
+}
+
 /* ---------- Excel ---------- */
 async function descargar(nombre, hojas) {
   if (!DL) { toast('La descarga de Excel no está disponible en esta vista. Abre la página en claude.ai o en la app de Claude.'); return; }
@@ -1238,7 +1607,7 @@ function vistaInventario() {
   const provs = [...new Set(todosLosItems().filter(i => i.proveedor).map(i => i.proveedor))].sort(cmpNom);
   return `
   <div class="encab"><div><h2>Inventario actual</h2><p>Existencias de OSPOS al ${fecha(MODELO.fechaCorte)}. Valor = existencia × precio sin IVA de la presentación. Toca un insumo para ver su detalle.</p></div>
-  <button class="btn" data-accion="xls-inventario">Exportar a Excel</button></div>
+  <button class="btn" data-accion="xls-inventario" title="Informe por género: tablero ejecutivo, resumen y una hoja por género">Excel por género</button></div>
   <div class="ctrl">
     ${campoBuscar('inv-q', 'Buscar insumo', E.inv.q, 'Ej.: harina, capacillo, Proingra')}
     <label class="campo"><span>Estado</span><select id="inv-estado">${['todos', 'bajo', 'especial', 'normal', 'sin-consumo', 'sobre'].map(v => `<option value="${v}" ${E.inv.estado === v ? 'selected' : ''}>${v === 'todos' ? 'Todos' : v === 'especial' ? 'Materia prima especial' : ESTADO_TXT[v]}</option>`).join('')}</select></label>
@@ -2099,7 +2468,7 @@ document.addEventListener('click', ev => {
       case 'ia-parar': if (_ctlIA) _ctlIA.abort(); return;
       case 'ia-limpiar': if (VOZ_OK) window.speechSynthesis.cancel(); E.chat.leyendo = null; E.chat.turnos = []; E.chat.error = ''; render(); return;
       case 'ia-hablar': hablar(+a.dataset.i); return;
-      case 'xls-inventario': xlsInventario(); return;
+      case 'xls-inventario': xlsInformeGeneros(); return;
       case 'xls-gastos': xlsGastos(); return;
       case 'xls-mensual': xlsMensual(); return;
       case 'xls-precios': xlsPrecios(); return;
